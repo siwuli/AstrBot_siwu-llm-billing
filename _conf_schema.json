@@ -1,0 +1,61 @@
+{
+  "bill_enabled": {
+    "description": "启用 LLM 全量账单",
+    "hint": "关闭后不再包装 Provider，采集与命令全部停用",
+    "type": "bool",
+    "default": true
+  },
+  "bill_admin_only": {
+    "description": "账单命令仅管理员可用",
+    "hint": "开启后仅 AstrBot 全局管理员或群管理员可查询；关闭则所有人可用",
+    "type": "bool",
+    "default": true
+  },
+  "bill_currency_symbol": {
+    "description": "显示货币符号",
+    "hint": "只影响显示；单价表统一按 USD / 百万 token 填写",
+    "type": "string",
+    "default": "¥"
+  },
+  "bill_usd_cny": {
+    "description": "USD → 显示货币的汇率",
+    "hint": "默认 7.2，用于把 USD 单价换算成人民币金额",
+    "type": "float",
+    "default": 7.2
+  },
+  "bill_prices": {
+    "description": "模型单价表（USD / 百万 token）",
+    "hint": "每行格式：provider|model = 非缓存输入, 缓存命中输入, 输出。也支持只写 model 或只写 provider（按最长匹配）。未匹配到的调用按 0 计费",
+    "type": "list",
+    "default": [
+      "mimo-v2.6-flash = 0.14, 0.0028, 0.28",
+      "mimo-v2.6-pro = 0.435, 0.0036, 0.87",
+      "mimo-v2.5 = 0.14, 0.0028, 0.28",
+      "mimo-v2.5-pro = 0.435, 0.0036, 0.87"
+    ]
+  },
+  "bill_report_enabled": {
+    "description": "启用每日账单日报",
+    "hint": "到点后把当日账单推送到「日报接收目标」里的会话",
+    "type": "bool",
+    "default": false
+  },
+  "bill_report_time": {
+    "description": "日报推送时间",
+    "hint": "24 小时制 HH:MM，按服务器本地时区",
+    "type": "string",
+    "default": "21:00"
+  },
+  "bill_report_targets": {
+    "description": "日报接收目标",
+    "hint": "填会话 UMO（如 qq_official_bot:GroupMessage:285012513）；也可只填群号，插件会自动用最近见过的会话补齐",
+    "type": "list",
+    "default": []
+  },
+  "bill_retention_days": {
+    "description": "账单数据保留天数",
+    "hint": "日报发送成功后顺带清理更早的记录；0 表示不清理",
+    "type": "int",
+    "default": 180
+  }
+}
