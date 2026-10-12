@@ -28,6 +28,7 @@ import inspect
 import os
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -75,7 +76,8 @@ _ORIGIN_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("caption", ("get_image_caption", "group_chat_context")),
     ("memory", ("memory_processor", "memory_reflection", "memory_engine", "consolidation_manager")),
     ("learning", ("progressive_learning", "realtime_processor", "style_analyzer",
-                  "persona_updater", "expression_learning", "expression_pattern")),
+                  "persona_updater", "expression_learning", "expression_pattern",
+                  "framework_llm_adapter")),
     ("jargon", ("jargon_miner", "jargon_query", "jargon_")),
     ("decision", ("decision_ai", "probability_manager", "proactive_chat", "attention_manager")),
 )
@@ -239,6 +241,7 @@ def _emit(self, meth: str, resp, kw: dict, started: float, err: str | None) -> N
             "origin": _classify(frames, plugin),
             "plugin": plugin,
             "umo": _UMO.get(),
+            "thread": threading.current_thread().name,
             "stack": " | ".join(frames[:4])[:400],
             "err": (err or "")[:200],
         })
@@ -342,26 +345,29 @@ class Store:
                     ts REAL NOT NULL, kind TEXT, cls TEXT, pid TEXT, model TEXT,
                     dur_ms REAL, prompt_chars INTEGER, system_chars INTEGER,
                     in_other INTEGER, in_cached INTEGER, out INTEGER,
-                    origin TEXT, plugin TEXT, umo TEXT, stack TEXT, err TEXT)"""
+                    origin TEXT, plugin TEXT, umo TEXT, stack TEXT, thread TEXT, err TEXT)"""
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts)")
             conn.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
-            # 迁移：老库补 stack 列（诊断归因用）
+            # 迁移：老库补 stack / thread 列（诊断归因用）
             cols = {row[1] for row in conn.execute("PRAGMA table_info(calls)")}
             if "stack" not in cols:
                 conn.execute("ALTER TABLE calls ADD COLUMN stack TEXT")
+            if "thread" not in cols:
+                conn.execute("ALTER TABLE calls ADD COLUMN thread TEXT")
 
     def insert(self, rows: list[dict]) -> None:
         if not rows:
             return
         for row in rows:
             row.setdefault("stack", "")
+            row.setdefault("thread", "")
         with self._conn() as conn:
             conn.executemany(
                 """INSERT INTO calls(ts,kind,cls,pid,model,dur_ms,prompt_chars,system_chars,
-                       in_other,in_cached,out,origin,plugin,umo,stack,err)
+                       in_other,in_cached,out,origin,plugin,umo,stack,thread,err)
                    VALUES(:ts,:kind,:cls,:pid,:model,:dur_ms,:prompt_chars,:system_chars,
-                       :in_other,:in_cached,:out,:origin,:plugin,:umo,:stack,:err)""",
+                       :in_other,:in_cached,:out,:origin,:plugin,:umo,:stack,:thread,:err)""",
                 rows,
             )
 
@@ -385,8 +391,8 @@ class Store:
         return [{"key": r[0], "calls": r[1], "in_other": r[2], "in_cached": r[3], "out": r[4]} for r in rows]
 
     def group_pairs(self, dim1: str, dim2: str, start: float, end: float) -> list[dict]:
-        """按两个维度交叉聚合（用于按来源分摊成本，需要 model 才能定价）。"""
-        dim1 = dim1 if dim1 in ("origin", "plugin", "pid") else "origin"
+        """按两个维度交叉聚合（用于按来源/插件分摊成本，需要 model 才能定价）。"""
+        dim1 = dim1 if dim1 in ("origin", "plugin", "pid", "model") else "origin"
         dim2 = dim2 if dim2 in ("model", "pid") else "model"
         with self._conn() as conn:
             rows = conn.execute(
@@ -403,10 +409,10 @@ class Store:
         """最近若干次调用（含调用栈快照），用于核对归因。"""
         with self._conn() as conn:
             rows = conn.execute(
-                """SELECT ts,kind,pid,model,in_other,in_cached,out,origin,plugin,stack
+                """SELECT ts,kind,pid,model,in_other,in_cached,out,origin,plugin,stack,thread
                    FROM calls ORDER BY ts DESC LIMIT ?""", (limit,)).fetchall()
         keys = ("ts", "kind", "pid", "model", "in_other", "in_cached", "out",
-                "origin", "plugin", "stack")
+                "origin", "plugin", "stack", "thread")
         return [dict(zip(keys, row)) for row in rows]
 
     def recent_umo_for(self, group_id: str) -> str:
@@ -679,8 +685,8 @@ class LlmBillingPlugin(star.Star):
                 f"{_fmt_tokens(row['in_other'])}(+{_fmt_tokens(row['in_cached'])} 缓存)"
                 f"→{_fmt_tokens(row['out'])}｜{self._money(cost)}"
             )
-            if index < 3 and row.get("stack"):
-                lines.append(f"      ↳ {str(row['stack'])[:110]}")
+            if index < 3 and (row.get("stack") or row.get("thread")):
+                lines.append(f"      ↳ [{row.get('thread') or '?'}] {str(row.get('stack') or '')[:100]}")
         return "\n".join(lines)
 
     def _render_origin(self, days: int) -> str:
@@ -694,17 +700,29 @@ class LlmBillingPlugin(star.Star):
         return "\n".join(lines)
 
     def _render_group(self, title: str, dim: str, days: int) -> str:
+        """按单一维度聚合（金额靠交叉 model 才能算准）。"""
         start, end = self._window(days)
         prices = self._prices()
-        rows = self.store.group(dim, start, end, limit=10)
-        if not rows:
+        agg: dict[str, dict] = {}
+        for row in self.store.group_pairs(dim, "model", start, end):
+            key = row["a"] or ""
+            if dim == "plugin" and key in ("", "(未知)"):
+                key = "内置/核心"  # 内置 star（如图片描述）不属于任何插件
+            elif not key:
+                key = "(未知)"
+            item = agg.setdefault(key, {"calls": 0, "cost": 0.0, "cached": 0})
+            item["calls"] += row["calls"]
+            item["cached"] += row["in_cached"]
+            item["cost"] += compute_cost(prices, "", row["b"], row["in_other"],
+                                         row["in_cached"], row["out"])
+        if not agg:
             return f"📊 {title}：暂无数据"
         lines = [f"📊 {title}"]
-        for row in rows:
-            cost = compute_cost(prices, "", row["key"], row["in_other"], row["in_cached"], row["out"])
-            label = ORIGIN_LABELS.get(row["key"], row["key"]) if dim == "origin" else row["key"]
+        ranked = sorted(agg.items(), key=lambda kv: kv[1]["cost"], reverse=True)[:10]
+        for key, item in ranked:
+            label = ORIGIN_LABELS.get(key, key) if dim == "origin" else key
             lines.append(
-                f"  · {label}：{row['calls']} 次 {self._money(cost)}"
-                f"（缓存 {_fmt_tokens(row['in_cached'])}）"
+                f"  · {label}：{item['calls']} 次 {self._money(item['cost'])}"
+                f"（缓存 {_fmt_tokens(item['cached'])}）"
             )
         return "\n".join(lines)
