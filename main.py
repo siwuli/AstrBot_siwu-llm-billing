@@ -13,6 +13,13 @@ db_helper.insert_provider_stat(...)，且 agent_type 写死为 "internal"。于�
 
 本插件的做法：在 **Provider 层**包装 text_chat / text_chat_stream，于是无论调用方
 是管线还是插件直连，都能拿到真实 usage（含缓存命中），并按调用栈归因到「谁花的钱」。
+归因采集的是**协程创建时**的栈：agent 会把调用塞进子任务执行（_await_or_stop 里的
+create_task、wait_for 等），执行栈里只剩 asyncio 内部帧，只有创建栈才含调用方。
+
+向量化调用（embedding）同样登记：provider 层采集调用方，SDK 层（OpenAI 兼容 /
+阿里云百炼）钩子读 usage 里的输入 token。
+
+单价支持峰谷：键写 ``model@peak`` / ``model@offpeak``，时段由 bill_peak_windows 定义。
 
 设计约定（遵循插件模板）：
     - 采集在 provider 层，不在 pipeline hook，这是本插件与 cost-control 类插件的根本区别
@@ -26,11 +33,12 @@ import asyncio
 import contextvars
 import inspect
 import os
+import re
 import sqlite3
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from astrbot.api import logger, star
 from astrbot.api.all import AstrBotConfig, AstrMessageEvent, MessageChain
@@ -52,13 +60,37 @@ _SELF_FILE = os.path.abspath(__file__)
 # 当前请求所属会话（由 on_llm_request 写入，仅供归因，不改请求内容）
 _UMO: contextvars.ContextVar[str] = contextvars.ContextVar("siwu_bill_umo", default="")
 
-# model 名 -> (非缓存输入, 缓存命中输入, 输出) USD / 百万 token
+# model 名 -> (非缓存输入, 缓存命中输入, 输出)，单位：USD / 百万 token
+# 键可带 @peak / @offpeak 后缀，表示高峰 / 空闲时段价（见 bill_peak_windows）
 DEFAULT_PRICES: dict[str, tuple[float, float, float]] = {
+    # 小米 MiMo（官方英文价，USD）
     "mimo-v2.6-flash": (0.14, 0.0028, 0.28),
     "mimo-v2.6-pro": (0.435, 0.0036, 0.87),
+    "mimo-v2.6-pro-ultraspeed": (4.35, 0.036, 8.7),
+    # 已下线但仍可调用的 MiMo V2.5（沿用原价）
     "mimo-v2.5": (0.14, 0.0028, 0.28),
     "mimo-v2.5-pro": (0.435, 0.0036, 0.87),
+    # DeepSeek V4.1 Flash 系列（官方 ¥2/¥0.04/¥8 高峰，¥1/¥0.02/¥4 空闲，按 7.2 折 USD）
+    "deepseek-v4.1-flash@peak": (0.2778, 0.0056, 1.1111),
+    "deepseek-v4.1-flash@offpeak": (0.1389, 0.0028, 0.5556),
+    "deepseek-v4-flash@peak": (0.2778, 0.0056, 1.1111),
+    "deepseek-v4-flash@offpeak": (0.1389, 0.0028, 0.5556),
+    "deepseek-v4-flash-vision-exp@peak": (0.2778, 0.0056, 1.1111),
+    "deepseek-v4-flash-vision-exp@offpeak": (0.1389, 0.0028, 0.5556),
+    # DeepSeek V4 Pro（官方 ¥9/¥0.30/¥27 高峰，¥4.5/¥0.15/¥13.5 空闲）
+    "deepseek-v4-pro@peak": (1.25, 0.0417, 3.75),
+    "deepseek-v4-pro@offpeak": (0.625, 0.0208, 1.875),
+    # 硅基流动 Qwen3-VL-32B-Instruct（输入 $0.2 / 输出 $0.6 每百万 token）
+    "Qwen/Qwen3-VL-32B-Instruct": (0.2, 0.2, 0.6),
+    # 向量模型：前两格填输入价（缓存/输出不适用）
+    "Qwen/Qwen3-Embedding-4B": (0.02, 0.02, 0.02),
+    "qwen3.7-text-embedding-flash": (0.0174, 0.0174, 0.0174),
 }
+
+# 高峰时段定义：<周几> <HH:MM>-<HH:MM>，分号分隔；1=周一 … 7=周日。
+# 默认取自 DeepSeek 官方口径（北京时间周一至周五 9:00-12:00、14:00-18:00，
+# 其余时段含周末与法定节假日为空闲时段）。
+DEFAULT_PEAK_WINDOWS = "1-5 09:00-12:00; 1-5 14:00-18:00"
 
 ORIGIN_LABELS = {
     "reply": "回复生成（管线）",
@@ -67,6 +99,7 @@ ORIGIN_LABELS = {
     "jargon": "黑话挖掘",
     "learning": "风格/人格学习",
     "memory": "记忆抽取/反思",
+    "embedding": "向量化（embedding）",
     "other": "其他插件",
     "unknown": "未知来源",
 }
@@ -115,31 +148,166 @@ def parse_prices(raw: object) -> dict[str, tuple[float, float, float]]:
         if not nums:
             continue
         nums = (nums + [nums[-1], nums[-1]])[:3]
-        prices[key.strip()] = (nums[0], nums[1], nums[2])
+        key = re.sub(r"\s*@\s*", "@", key.strip())
+        prices[key] = (nums[0], nums[1], nums[2])
     return prices
 
 
-def match_price(prices: dict[str, tuple[float, float, float]], pid: str, model: str):
-    """按 ``provider|model`` → ``model`` → ``provider`` → 模糊最长匹配找单价。"""
+# 中国法定节假日（官方峰谷口径：节假日全天计入空闲时段）
+#
+# DeepSeek 价目页脚注：「北京时间周一至周五（不含中国法定节假日）9:00-12:00、
+# 14:00-18:00 为高峰时段；其余时段，包括周末及中国法定节假日全天均为空闲时段。」
+# 所以只排除周末不够：节假日落在一周内时，峰段也必须按闲时计，否则会多计一倍。
+# 数据来源：国务院办公厅关于 2026 年部分节假日安排的通知（国办发明电〔2025〕7 号）。
+# 调休补班的周六/周日不计高峰——计费规则只看「周一至周五」，调休不改变这一点。
+CN_HOLIDAYS_2026: tuple[str, ...] = (
+    "2026-01-01", "2026-01-02", "2026-01-03",                          # 元旦
+    "2026-02-15", "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19",
+    "2026-02-20", "2026-02-21", "2026-02-22", "2026-02-23",            # 春节
+    "2026-04-04", "2026-04-05", "2026-04-06",                          # 清明
+    "2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05",  # 劳动节
+    "2026-06-19", "2026-06-20", "2026-06-21",                          # 端午
+    "2026-09-25", "2026-09-26", "2026-09-27",                          # 中秋
+    "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04",
+    "2026-10-05", "2026-10-06", "2026-10-07",                          # 国庆
+)
+DEFAULT_HOLIDAYS = ",".join(CN_HOLIDAYS_2026)
+DEFAULT_TIMEZONE = "Asia/Shanghai"
+_HOLIDAY_CACHE: dict[str, set[str]] = {}
+
+
+def normalize_holidays(raw: object) -> set[str]:
+    """把节假日配置规整成 ``{'YYYY-MM-DD'}``；``off`` / ``none`` / ``-`` 表示停用。"""
+    if isinstance(raw, (list, tuple)):
+        items = [str(item) for item in raw]
+    else:
+        text = str(raw or "")
+        if text.strip().lower() in {"off", "none", "-", "0"}:
+            return set()
+        items = re.split(r"[\s,，;；]+", text)
+    out = set()
+    for item in items:
+        match = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", str(item).strip())
+        if match:
+            out.add(f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}")
+    return out
+
+
+_UTC_NAMES = {"utc", "etc/utc", "gmt", "etc/gmt", "z"}
+_TZ_WARNED: set[str] = set()
+
+
+def _zone(name: object):
+    """取时区；UTC 直接用 stdlib（有的镜像把 /usr/share/zoneinfo/UTC 覆盖成了本地时区）。"""
+    key = str(name or "").strip() or DEFAULT_TIMEZONE
+    if key.lower() in _UTC_NAMES:
+        return timezone.utc
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(key)
+    except Exception as e:  # noqa: BLE001 - 缺 tzdata 时退回服务器本地时区（并告警一次）
+        if key not in _TZ_WARNED:
+            _TZ_WARNED.add(key)
+            logger.warning("[llm_billing] 时区 %s 不可用（%s），峰谷判定退回服务器本地时区", key, e)
+        return None
+
+
+def _holiday_set(raw: object) -> set[str]:
+    key = raw if isinstance(raw, str) else repr(raw)
+    if key not in _HOLIDAY_CACHE:
+        if len(_HOLIDAY_CACHE) > 32:
+            _HOLIDAY_CACHE.clear()
+        _HOLIDAY_CACHE[key] = normalize_holidays(raw)
+    return _HOLIDAY_CACHE[key]
+
+
+def parse_peak_windows(raw: object) -> list[tuple[set[int], int, int]]:
+    """解析高峰时段配置：``1-5 09:00-12:00; 1-5 14:00-18:00``。
+
+    返回 [(周几集合, 起始分钟, 结束分钟)]，1=周一 … 7=周日。
+    """
+    rules: list[tuple[set[int], int, int]] = []
+    text = str(raw or "").replace("；", ";").replace("，", ",")
+    for chunk in text.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split()
+        if len(parts) != 2 or "-" not in parts[1]:
+            continue
+        days: set[int] = set()
+        for piece in parts[0].replace("，", ",").split(","):
+            piece = piece.strip()
+            if "-" in piece:
+                a, _, b = piece.partition("-")
+                try:
+                    days.update(range(int(a), int(b) + 1))
+                except ValueError:
+                    continue
+            else:
+                try:
+                    days.add(int(piece))
+                except ValueError:
+                    continue
+        try:
+            start, _, end = parts[1].partition("-")
+            sh, sm = (int(x) for x in start.split(":"))
+            eh, em = (int(x) for x in end.split(":"))
+        except ValueError:
+            continue
+        if days:
+            rules.append((days, sh * 60 + sm, eh * 60 + em))
+    return rules
+
+
+def is_peak(ts: float, windows: object, holidays: object = "", tz: object = DEFAULT_TIMEZONE) -> bool:
+    """判断某次调用是否落在高峰时段（口径见 CN_HOLIDAYS_2026 上方注释）。"""
+    try:
+        when = datetime.fromtimestamp(ts, _zone(tz))
+    except (OSError, OverflowError, ValueError):
+        return False
+    if when.strftime("%Y-%m-%d") in _holiday_set(holidays):
+        return False
+    minute = when.hour * 60 + when.minute
+    weekday = when.isoweekday()
+    for days, start, end in parse_peak_windows(windows):
+        if weekday in days and start <= minute < end:
+            return True
+    return False
+
+
+def match_price(prices: dict[str, tuple[float, float, float]], pid: str, model: str,
+                window: str = ""):
+    """按 ``provider|model`` → ``model`` → ``provider`` → 模糊最长匹配找单价。
+
+    ``window`` 为 ``peak`` / ``offpeak`` 时优先用带 ``@peak`` / ``@offpeak`` 后缀的单价，
+    其次用不带后缀的通用价，最后退回另一时段价（哪个时段没配就用另一个）。
+    """
     pid = str(pid or "")
     model = str(model or "")
-    candidates = [f"{pid}|{model}", model, pid, pid.split("/")[-1]]
-    for key in candidates:
-        key = str(key or "").strip()
-        if key and key in prices:
-            return prices[key]
+    suffixes = [f"@{window}"] if window else []
+    suffixes += ["", f"@{'offpeak' if window == 'peak' else 'peak'}"] if window else [""]
+    for suffix in suffixes:
+        for key in (f"{pid}|{model}", model, pid, pid.split("/")[-1]):
+            candidate = f"{str(key or '').strip()}{suffix}"
+            if candidate.strip("@") and candidate in prices:
+                return prices[candidate]
     best = None
     hay = f"{pid}|{model}".lower()
     for key, val in prices.items():
-        k = key.lower().strip()
+        base, _, suffix = key.partition("@")
+        if suffix and suffix != window:
+            continue
+        k = base.lower().strip()
         hit = k and (k in hay or (model and k == str(model).lower()))
         if hit and (best is None or len(k) > len(best[0])):
             best = (k, val)
     return best[1] if best else None
 
 
-def compute_cost(prices, pid: str, model: str, in_other: int, in_cached: int, out: int) -> float:
-    price = match_price(prices, pid, model)
+def compute_cost(prices, pid: str, model: str, in_other: int, in_cached: int, out: int,
+                 window: str = "") -> float:
+    price = match_price(prices, pid, model, window)
     if not price:
         return 0.0
     p_in, p_cached, p_out = price
@@ -312,6 +480,265 @@ def _wrap(meth: str, fn):
     return wrapper_stream
 
 
+# ----------------------------------------------------------------------
+# 向量化（embedding）通道
+# ----------------------------------------------------------------------
+# provider 层采集到的调用方，供 SDK 层钩子拿到 usage 后落账
+_EMB_CTX: contextvars.ContextVar[dict | None] = contextvars.ContextVar("siwu_bill_emb", default=None)
+_EMB_ORIGINALS: list[tuple[object, str, object]] = []
+_EMB_PATCHED: set[str] = set()
+_EMB_PROVIDERS: dict[tuple[type, str], object] = {}
+
+
+def _push(row: dict) -> None:
+    _BUFFER.append(row)
+    del _BUFFER[:-2000]
+
+
+def _emb_texts(args: tuple, kwargs: dict) -> list[str]:
+    if args:
+        first = args[0]
+        items = first if isinstance(first, (list, tuple)) else [first]
+    else:
+        raw = kwargs.get("input") or kwargs.get("texts") or kwargs.get("text") or ""
+        items = raw if isinstance(raw, (list, tuple)) else [raw]
+    return [str(item) for item in items]
+
+
+def _emb_usage(resp) -> int:
+    """从各家响应里取输入 token 数（拿不到就记 0）。"""
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return 0
+    for key in ("prompt_tokens", "input_tokens", "total_tokens"):
+        value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, None)
+        if value:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _emb_model(resp, kwargs: dict, ctx: dict | None = None) -> str:
+    model = getattr(resp, "model", "") or kwargs.get("model") or ""
+    if not model and ctx:
+        model = str(ctx.get("model") or "")
+    return str(model)
+
+
+def _emit_embedding(model: str, tokens: int, texts: list[str], started: float,
+                    err: str | None, created: tuple[list[str], str] | None = None) -> None:
+    """记一条 embedding 调用：只有输入 token，来源固定为「向量化」。"""
+    try:
+        ctx = _EMB_CTX.get() or {}
+        frames, plugin = created or ([], "")
+        made = ctx.get("frames") or []
+        if made:
+            frames = made + [f for f in frames if f not in made]
+        _push({
+            "ts": time.time(),
+            "kind": "embedding",
+            "cls": "",
+            "pid": str(ctx.get("pid") or ""),
+            "model": model or str(ctx.get("model") or ""),
+            "dur_ms": round((time.time() - started) * 1000, 1),
+            "prompt_chars": sum(len(text) for text in texts),
+            "system_chars": len(texts),
+            "in_other": tokens, "in_cached": 0, "out": 0,
+            "origin": "embedding",
+            "plugin": str(ctx.get("plugin") or plugin),
+            "umo": _UMO.get(),
+            "thread": threading.current_thread().name,
+            "stack": " | ".join(frames[:4])[:400],
+            "err": (err or "")[:200],
+        })
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[llm_billing] embedding 记录失败: %s", e)
+
+
+def _emb_provider_model(self) -> str:
+    try:
+        model = getattr(self, "model", "") or ""
+        if not model:
+            model = str((getattr(self, "provider_config", None) or {}).get("embedding_model") or "")
+        return str(model)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _wrap_embedding_provider(fn):
+    """包一层只为采集调用方；token 由 SDK 层钩子在拿到 usage 后落账。"""
+    def wrapper(self, *args, **kwargs):
+        frames, plugin = _stack_info(sys._getframe(1))
+        ctx = {"frames": frames, "plugin": plugin, "model": _emb_provider_model(self)}
+        token = _EMB_CTX.set(ctx)
+        try:
+            result = fn(self, *args, **kwargs)
+        except Exception:
+            _EMB_CTX.reset(token)
+            raise
+        if inspect.iscoroutine(result):
+            async def _await_it():
+                try:
+                    return await result
+                finally:
+                    _EMB_CTX.reset(token)
+            return _await_it()
+        _EMB_CTX.reset(token)
+        return result
+
+    wrapper._siwu_billing = True
+    return wrapper
+
+
+def _wrap_openai_embedding_create(original, is_async: bool):
+    if not is_async:
+        def create_sync(self, *args, **kwargs):
+            created = _stack_info(sys._getframe(1))
+            texts = _emb_texts(args, kwargs)
+            started, resp, err = time.time(), None, None
+            try:
+                resp = original(self, *args, **kwargs)
+                return resp
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                raise
+            finally:
+                _emit_embedding(_emb_model(resp, kwargs), _emb_usage(resp), texts, started, err, created)
+        return create_sync
+
+    def create(self, *args, **kwargs):
+        created = _stack_info(sys._getframe(1))
+        texts = _emb_texts(args, kwargs)
+        started = time.time()
+        coro = original(self, *args, **kwargs)
+
+        async def _run():
+            resp, err = None, None
+            try:
+                resp = await coro
+                return resp
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                raise
+            finally:
+                _emit_embedding(_emb_model(resp, kwargs), _emb_usage(resp), texts, started, err, created)
+        return _run()
+    return create
+
+
+def _wrap_dashscope_embedding_call(original):
+    def call(*args, **kwargs):
+        created = _stack_info(sys._getframe(1))
+        texts = _emb_texts(args, kwargs)
+        started, resp, err = time.time(), None, None
+        try:
+            resp = original(*args, **kwargs)
+            return resp
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            raise
+        finally:
+            _emit_embedding(str(kwargs.get("model") or ""), _emb_usage(resp), texts, started, err, created)
+    return call
+
+
+def patch_embedding_providers() -> tuple[int, list[str]]:
+    """包装 EmbeddingProvider 的 get_embedding(s)，用于归因（幂等）。"""
+    try:
+        from astrbot.core.provider.provider import EmbeddingProvider
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[llm_billing] 找不到 EmbeddingProvider: %s", e)
+        return 0, []
+
+    classes: list[type] = [EmbeddingProvider]
+
+    def walk(cls):
+        for sub in cls.__subclasses__():
+            classes.append(sub)
+            walk(sub)
+
+    walk(EmbeddingProvider)
+    patched = 0
+    for cls in classes:
+        for meth in ("get_embedding", "get_embeddings"):
+            fn = cls.__dict__.get(meth)
+            if fn is None or getattr(fn, "_siwu_billing", False):
+                continue
+            if not inspect.iscoroutinefunction(fn):
+                continue
+            setattr(cls, meth, _wrap_embedding_provider(fn))
+            _EMB_PROVIDERS[(cls, meth)] = fn
+            patched += 1
+    return patched, [c.__name__ for c in classes]
+
+
+def unpatch_embedding_providers() -> int:
+    n = 0
+    for (cls, meth), fn in list(_EMB_PROVIDERS.items()):
+        try:
+            setattr(cls, meth, fn)
+            n += 1
+        except Exception:  # noqa: BLE001, S110
+            pass
+        _EMB_PROVIDERS.pop((cls, meth), None)
+    return n
+
+
+def patch_embeddings() -> tuple[int, list[str]]:
+    """挂上能拿到 usage 的 embedding SDK 钩子（OpenAI 兼容 / 阿里云百炼）。"""
+    hooked: list[str] = []
+
+    def _hook(obj, name: str, factory) -> None:
+        if obj is None:
+            return
+        key = f"{getattr(obj, '__module__', '?')}.{getattr(obj, '__name__', name)}"
+        if key in _EMB_PATCHED:
+            return
+        raw = obj.__dict__.get(name)
+        original = getattr(obj, name, None)  # classmethod 要取绑定后的可调用对象
+        if raw is None or original is None:
+            return
+        try:
+            setattr(obj, name, factory(original))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[llm_billing] embedding 钩子挂载失败 %s: %s", key, e)
+            return
+        _EMB_ORIGINALS.append((obj, name, raw))
+        _EMB_PATCHED.add(key)
+        hooked.append(key)
+
+    try:
+        from openai.resources.embeddings import AsyncEmbeddings, Embeddings
+        _hook(AsyncEmbeddings, "create", lambda fn: _wrap_openai_embedding_create(fn, True))
+        _hook(Embeddings, "create", lambda fn: _wrap_openai_embedding_create(fn, False))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[llm_billing] openai embedding 钩子不可用: %s", e)
+
+    try:
+        import dashscope
+        for cls_name in ("TextEmbedding", "MultiModalEmbedding"):
+            _hook(getattr(dashscope, cls_name, None), "call", _wrap_dashscope_embedding_call)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[llm_billing] dashscope embedding 钩子不可用: %s", e)
+
+    return len(hooked), hooked
+
+
+def unpatch_embeddings() -> int:
+    n = 0
+    for obj, name, original in reversed(_EMB_ORIGINALS):
+        try:
+            setattr(obj, name, original)
+            n += 1
+        except Exception:  # noqa: BLE001, S110
+            pass
+    _EMB_ORIGINALS.clear()
+    _EMB_PATCHED.clear()
+    return n
+
+
 def patch_providers() -> tuple[int, list[str]]:
     """包装所有 Provider 子类的 text_chat / text_chat_stream（幂等）。"""
     from astrbot.core.provider.provider import Provider
@@ -413,31 +840,14 @@ class Store:
                    FROM calls WHERE ts>=? AND ts<?""", (start, end)).fetchone()
         return {"calls": row[0], "in_other": row[1], "in_cached": row[2], "out": row[3], "errors": row[4]}
 
-    def group(self, dim: str, start: float, end: float, limit: int = 8) -> list[dict]:
-        dim = dim if dim in ("origin", "model", "plugin", "pid") else "origin"
+    def rows(self, start: float, end: float) -> list[dict]:
+        """区间内逐条调用：峰谷价按调用时刻判定，所以报表必须逐行计价。"""
         with self._conn() as conn:
             rows = conn.execute(
-                f"""SELECT coalesce(nullif({dim},''),'(未知)') k, count(*),
-                           coalesce(sum(in_other),0), coalesce(sum(in_cached),0), coalesce(sum(out),0)
-                    FROM calls WHERE ts>=? AND ts<?
-                    GROUP BY k ORDER BY (coalesce(sum(in_other),0)+coalesce(sum(in_cached),0)+coalesce(sum(out),0)) DESC
-                    LIMIT ?""", (start, end, limit)).fetchall()
-        return [{"key": r[0], "calls": r[1], "in_other": r[2], "in_cached": r[3], "out": r[4]} for r in rows]
-
-    def group_pairs(self, dim1: str, dim2: str, start: float, end: float) -> list[dict]:
-        """按两个维度交叉聚合（用于按来源/插件分摊成本，需要 model 才能定价）。"""
-        dim1 = dim1 if dim1 in ("origin", "plugin", "pid", "model") else "origin"
-        dim2 = dim2 if dim2 in ("model", "pid") else "model"
-        with self._conn() as conn:
-            rows = conn.execute(
-                f"""SELECT coalesce(nullif({dim1},''),'(未知)') a,
-                           coalesce(nullif({dim2},''),'(未知)') b,
-                           count(*), coalesce(sum(in_other),0),
-                           coalesce(sum(in_cached),0), coalesce(sum(out),0)
-                    FROM calls WHERE ts>=? AND ts<? GROUP BY a, b""",
-                (start, end)).fetchall()
-        return [{"a": r[0], "b": r[1], "calls": r[2], "in_other": r[3],
-                 "in_cached": r[4], "out": r[5]} for r in rows]
+                """SELECT ts, kind, pid, model, in_other, in_cached, out, origin, plugin
+                   FROM calls WHERE ts>=? AND ts<?""", (start, end)).fetchall()
+        keys = ("ts", "kind", "pid", "model", "in_other", "in_cached", "out", "origin", "plugin")
+        return [dict(zip(keys, row)) for row in rows]
 
     def recent(self, limit: int = 8) -> list[dict]:
         """最近若干次调用（含调用栈快照），用于核对归因。"""
@@ -501,8 +911,12 @@ class LlmBillingPlugin(star.Star):
             return
         self.store = Store()
         patched, classes = patch_providers()
+        emb_providers, emb_classes = patch_embedding_providers()
+        emb_hooks, hooks = patch_embeddings()
         logger.info("[llm_billing] 已包装 %s 个方法，覆盖 %s 个 Provider 类: %s",
                     patched, len(classes), classes)
+        logger.info("[llm_billing] embedding：%s 个 provider 方法（%s）、%s 个出账钩子 %s",
+                    emb_providers, emb_classes, emb_hooks, hooks)
         self._flush_task = asyncio.create_task(self._flush_loop())
         self._report_task = asyncio.create_task(self._report_loop())
 
@@ -512,7 +926,10 @@ class LlmBillingPlugin(star.Star):
                 task.cancel()
         await self._flush()
         n = unpatch_providers()
-        logger.info("[llm_billing] 已还原 %s 个 Provider 方法", n)
+        m = unpatch_embedding_providers()
+        k = unpatch_embeddings()
+        logger.info("[llm_billing] 已还原 %s 个 Provider 方法、%s 个 embedding 方法、%s 个 embedding 钩子",
+                    n, m, k)
 
     def _on(self) -> bool:
         return bool(self.config.get("bill_enabled", True))
@@ -526,6 +943,9 @@ class LlmBillingPlugin(star.Star):
                 n, _ = patch_providers()
                 if n:
                     logger.info("[llm_billing] 补包装 %s 个新 Provider 方法", n)
+                m, _ = patch_embedding_providers()
+                if m:
+                    logger.info("[llm_billing] 补包装 %s 个新 embedding 方法", m)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -651,6 +1071,43 @@ class LlmBillingPlugin(star.Star):
         rate = float(self.config.get("bill_usd_cny", 7.2) or 7.2)
         return f"{symbol}{usd * rate:.2f}"
 
+    def _peak_windows(self) -> str:
+        return str(self.config.get("bill_peak_windows", DEFAULT_PEAK_WINDOWS)
+                   or DEFAULT_PEAK_WINDOWS)
+
+    def _holidays(self) -> str:
+        raw = self.config.get("bill_holidays", DEFAULT_HOLIDAYS)
+        return DEFAULT_HOLIDAYS if raw is None or raw == "" else raw
+
+    def _timezone(self) -> str:
+        return str(self.config.get("bill_timezone", DEFAULT_TIMEZONE) or DEFAULT_TIMEZONE)
+
+    def _row_cost(self, prices, row: dict) -> float:
+        """逐行计价：同一模型高峰/空闲价不同，必须先定时刻再乘单价。"""
+        window = ("peak" if is_peak(row["ts"], self._peak_windows(),
+                                    self._holidays(), self._timezone())
+                  else "offpeak")
+        return compute_cost(prices, row["pid"], row["model"], row["in_other"],
+                            row["in_cached"], row["out"], window)
+
+    def _aggregate(self, rows: list[dict], dim: str) -> dict[str, dict]:
+        prices = self._prices()
+        agg: dict[str, dict] = {}
+        for row in rows:
+            key = str(row.get(dim) or "")
+            if dim == "plugin" and not key:
+                key = "内置/核心"  # 内置 star（如图片描述）不属于任何插件
+            elif not key:
+                key = "(未知)"
+            item = agg.setdefault(key, {"calls": 0, "cost": 0.0,
+                                        "in_other": 0, "in_cached": 0, "out": 0})
+            item["calls"] += 1
+            item["in_other"] += row["in_other"] or 0
+            item["in_cached"] += row["in_cached"] or 0
+            item["out"] += row["out"] or 0
+            item["cost"] += self._row_cost(prices, row)
+        return agg
+
     def _window(self, days: int) -> tuple[float, float]:
         now = datetime.now()  # noqa: DTZ005 - 按服务器本地时区
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -658,27 +1115,12 @@ class LlmBillingPlugin(star.Star):
             start = start - timedelta(days=days - 1)
         return start.timestamp(), (start + timedelta(days=days if days > 0 else 1)).timestamp()
 
-    def _origin_costs(self, start: float, end: float) -> tuple[dict[str, float], dict[str, int]]:
-        """按来源分摊成本：来源本身不含单价，必须交叉 model 才能算钱。"""
-        prices = self._prices()
-        cost: dict[str, float] = {}
-        calls: dict[str, int] = {}
-        for row in self.store.group_pairs("origin", "model", start, end):
-            key = row["a"]
-            cost[key] = cost.get(key, 0.0) + compute_cost(
-                prices, "", row["b"], row["in_other"], row["in_cached"], row["out"])
-            calls[key] = calls.get(key, 0) + row["calls"]
-        return cost, calls
-
     def _render(self, title: str, days: int) -> str:
         start, end = self._window(days)
         total = self.store.totals(start, end)
+        rows = self.store.rows(start, end)
         prices = self._prices()
-        by_model = self.store.group("model", start, end, limit=4)
-        usd = sum(
-            compute_cost(prices, "", row["key"], row["in_other"], row["in_cached"], row["out"])
-            for row in self.store.group("model", start, end, limit=50)
-        )
+        usd = sum(self._row_cost(prices, row) for row in rows)
         lines = [
             f"📊 LLM 账单 · {title}",
             f"调用 {total['calls']} 次（失败 {total['errors']}）｜花费 {self._money(usd)}",
@@ -687,19 +1129,17 @@ class LlmBillingPlugin(star.Star):
                 f"（缓存命中 {_fmt_tokens(total['in_cached'])}）｜输出 {_fmt_tokens(total['out'])}"
             ),
         ]
-        origin_cost, origin_calls = self._origin_costs(start, end)
-        if origin_cost:
+        by_origin = self._aggregate(rows, "origin")
+        if by_origin:
             lines.append("按来源：")
-            for key, cost in sorted(origin_cost.items(), key=lambda kv: kv[1], reverse=True)[:5]:
-                lines.append(
-                    f"  · {ORIGIN_LABELS.get(key, key)}：{origin_calls.get(key, 0)} 次 "
-                    f"{self._money(cost)}"
-                )
+            for key, item in sorted(by_origin.items(), key=lambda kv: kv[1]["cost"], reverse=True)[:5]:
+                lines.append(f"  · {ORIGIN_LABELS.get(key, key)}：{item['calls']} 次 "
+                             f"{self._money(item['cost'])}")
+        by_model = self._aggregate(rows, "model")
         if by_model:
             lines.append("按模型：")
-            for row in by_model:
-                cost = compute_cost(prices, "", row["key"], row["in_other"], row["in_cached"], row["out"])
-                lines.append(f"  · {row['key']}：{row['calls']} 次 {self._money(cost)}")
+            for key, item in sorted(by_model.items(), key=lambda kv: kv[1]["cost"], reverse=True)[:4]:
+                lines.append(f"  · {key}：{item['calls']} 次 {self._money(item['cost'])}")
         lines.append("（/账单 来源｜/账单 模型｜/账单 插件｜/账单 明细｜/账单 周｜/账单 月）")
         return "\n".join(lines)
 
@@ -712,12 +1152,14 @@ class LlmBillingPlugin(star.Star):
         for index, row in enumerate(rows):
             ts = datetime.fromtimestamp(row["ts"]).strftime("%H:%M:%S")  # noqa: DTZ006 - 本地时区
             label = ORIGIN_LABELS.get(row["origin"], row["origin"])
-            cost = compute_cost(prices, row["pid"], row["model"],
-                                row["in_other"], row["in_cached"], row["out"])
+            cost = self._row_cost(prices, row)
+            if row["kind"] == "embedding":
+                detail = f"向量 {_fmt_tokens(row['in_other'])}"
+            else:
+                detail = (f"{_fmt_tokens(row['in_other'])}(+{_fmt_tokens(row['in_cached'])} 缓存)"
+                          f"→{_fmt_tokens(row['out'])}")
             lines.append(
-                f"  {ts} {label}｜{row['plugin'] or '内置'}｜"
-                f"{_fmt_tokens(row['in_other'])}(+{_fmt_tokens(row['in_cached'])} 缓存)"
-                f"→{_fmt_tokens(row['out'])}｜{self._money(cost)}"
+                f"  {ts} {label}｜{row['plugin'] or '内置'}｜{detail}｜{self._money(cost)}"
             )
             if index < 3 and (row.get("stack") or row.get("thread")):
                 lines.append(f"      ↳ [{row.get('thread') or '?'}] {str(row.get('stack') or '')[:100]}")
@@ -725,30 +1167,17 @@ class LlmBillingPlugin(star.Star):
 
     def _render_origin(self, days: int) -> str:
         start, end = self._window(days)
-        cost, calls = self._origin_costs(start, end)
-        if not cost:
+        agg = self._aggregate(self.store.rows(start, end), "origin")
+        if not agg:
             return "📊 今日按来源：暂无数据"
         lines = ["📊 今日按来源（花费 / 次数）"]
-        for key, value in sorted(cost.items(), key=lambda kv: kv[1], reverse=True):
-            lines.append(f"  · {ORIGIN_LABELS.get(key, key)}：{self._money(value)} / {calls.get(key, 0)} 次")
+        for key, item in sorted(agg.items(), key=lambda kv: kv[1]["cost"], reverse=True):
+            lines.append(f"  · {ORIGIN_LABELS.get(key, key)}：{self._money(item['cost'])} / {item['calls']} 次")
         return "\n".join(lines)
 
     def _render_group(self, title: str, dim: str, days: int) -> str:
-        """按单一维度聚合（金额靠交叉 model 才能算准）。"""
         start, end = self._window(days)
-        prices = self._prices()
-        agg: dict[str, dict] = {}
-        for row in self.store.group_pairs(dim, "model", start, end):
-            key = row["a"] or ""
-            if dim == "plugin" and key in ("", "(未知)"):
-                key = "内置/核心"  # 内置 star（如图片描述）不属于任何插件
-            elif not key:
-                key = "(未知)"
-            item = agg.setdefault(key, {"calls": 0, "cost": 0.0, "cached": 0})
-            item["calls"] += row["calls"]
-            item["cached"] += row["in_cached"]
-            item["cost"] += compute_cost(prices, "", row["b"], row["in_other"],
-                                         row["in_cached"], row["out"])
+        agg = self._aggregate(self.store.rows(start, end), dim)
         if not agg:
             return f"📊 {title}：暂无数据"
         lines = [f"📊 {title}"]
@@ -757,6 +1186,6 @@ class LlmBillingPlugin(star.Star):
             label = ORIGIN_LABELS.get(key, key) if dim == "origin" else key
             lines.append(
                 f"  · {label}：{item['calls']} 次 {self._money(item['cost'])}"
-                f"（缓存 {_fmt_tokens(item['cached'])}）"
+                f"（缓存 {_fmt_tokens(item['in_cached'])}）"
             )
         return "\n".join(lines)

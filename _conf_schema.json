@@ -25,14 +25,49 @@
   },
   "bill_prices": {
     "description": "模型单价表（USD / 百万 token）",
-    "hint": "每行格式：provider|model = 非缓存输入, 缓存命中输入, 输出。也支持只写 model 或只写 provider（按最长匹配）。未匹配到的调用按 0 计费",
+    "hint": "每行：provider|model = 非缓存输入, 缓存命中输入, 输出（也可只写 model / provider，按最长匹配）。峰谷模型在键后加 @peak / @offpeak 写两行，时段由「高峰时段」决定；向量模型前两格填输入价。以 # 开头的行是注释；未匹配到的调用按 0 计费",
     "type": "list",
     "default": [
+      "# 小米 MiMo（官方英文价）",
       "mimo-v2.6-flash = 0.14, 0.0028, 0.28",
       "mimo-v2.6-pro = 0.435, 0.0036, 0.87",
+      "mimo-v2.6-pro-ultraspeed = 4.35, 0.036, 8.7",
       "mimo-v2.5 = 0.14, 0.0028, 0.28",
-      "mimo-v2.5-pro = 0.435, 0.0036, 0.87"
+      "mimo-v2.5-pro = 0.435, 0.0036, 0.87",
+      "# DeepSeek V4.1 Flash 系列（官方高峰 ¥2/¥0.04/¥8，空闲 ¥1/¥0.02/¥4）",
+      "deepseek-v4.1-flash @peak = 0.2778, 0.0056, 1.1111",
+      "deepseek-v4.1-flash @offpeak = 0.1389, 0.0028, 0.5556",
+      "deepseek-v4-flash @peak = 0.2778, 0.0056, 1.1111",
+      "deepseek-v4-flash @offpeak = 0.1389, 0.0028, 0.5556",
+      "deepseek-v4-flash-vision-exp @peak = 0.2778, 0.0056, 1.1111",
+      "deepseek-v4-flash-vision-exp @offpeak = 0.1389, 0.0028, 0.5556",
+      "# DeepSeek V4 Pro（官方高峰 ¥9/¥0.30/¥27，空闲 ¥4.5/¥0.15/¥13.5）",
+      "deepseek-v4-pro @peak = 1.25, 0.0417, 3.75",
+      "deepseek-v4-pro @offpeak = 0.625, 0.0208, 1.875",
+      "# 硅基流动 Qwen3-VL-32B-Instruct（输入 $0.2 / 输出 $0.6）",
+      "Qwen/Qwen3-VL-32B-Instruct = 0.2, 0.2, 0.6",
+      "# 向量模型：前两格填输入价（缓存命中不适用）",
+      "Qwen/Qwen3-Embedding-4B = 0.02, 0.02, 0.02",
+      "qwen3.7-text-embedding-flash = 0.0174, 0.0174, 0.0174"
     ]
+  },
+  "bill_peak_windows": {
+    "description": "高峰时段",
+    "hint": "格式「周几 HH:MM-HH:MM」，分号分隔，1=周一 … 7=周日；默认 DeepSeek 口径：周一至周五 9:00-12:00、14:00-18:00。不在高峰时段的一律按 @offpeak 价计",
+    "type": "string",
+    "default": "1-5 09:00-12:00; 1-5 14:00-18:00"
+  },
+  "bill_timezone": {
+    "description": "峰谷判定时区",
+    "hint": "IANA 名称（如 Asia/Shanghai、UTC）。高峰时段按此时区的本地时间判断",
+    "type": "string",
+    "default": "Asia/Shanghai"
+  },
+  "bill_holidays": {
+    "description": "法定节假日（全天按空闲价计）",
+    "hint": "YYYY-MM-DD，逗号分隔；默认内置 2026 年安排（国办发明电〔2025〕7 号）。填 off 可停用。调休补班的周六周日不计高峰，无需登记",
+    "type": "string",
+    "default": "2026-01-01,2026-01-02,2026-01-03,2026-02-15,2026-02-16,2026-02-17,2026-02-18,2026-02-19,2026-02-20,2026-02-21,2026-02-22,2026-02-23,2026-04-04,2026-04-05,2026-04-06,2026-05-01,2026-05-02,2026-05-03,2026-05-04,2026-05-05,2026-06-19,2026-06-20,2026-06-21,2026-09-25,2026-09-26,2026-09-27,2026-10-01,2026-10-02,2026-10-03,2026-10-04,2026-10-05,2026-10-06,2026-10-07"
   },
   "bill_report_enabled": {
     "description": "启用每日账单日报",
