@@ -1,8 +1,8 @@
 name: siwu_llm_billing
 display_name: LLM 全量账单
-desc: "统计**所有** LLM 调用（含插件直连 provider.text_chat 的那些）：在 Provider 层采集真实 usage（非缓存输入 / 缓存命中 / 输出），按调用栈归因到「回复生成 / 图片描述 / 群聊决策 / 黑话挖掘 / 风格学习 / 记忆抽取」等来源，支持单价换算与每日日报。补上 AstrBot 自带统计只记 agent 管线、cost-control 类插件只挂管线 hook 的盲区"
+desc: "在 Provider 层统计所有 LLM 调用的 token 与花费，按来源归因并支持单价换算和日报"
 help: "发送「账单」查看今日调用次数与花费；「账单 来源」看谁在花钱；「账单 模型」「账单 插件」「账单 明细」「账单 周」「账单 月」同理。需管理员权限（可配置关闭）"
-version: 1.0.4
+version: 1.0.5
 author: siwuli
 repo: https://github.com/siwuli/AstrBot_siwu-llm-billing
 astrbot_version: ">=4.0.0"
