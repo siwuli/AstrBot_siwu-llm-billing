@@ -568,24 +568,29 @@ def _emb_provider_model(self) -> str:
 
 
 def _wrap_embedding_provider(fn):
-    """包一层只为采集调用方；token 由 SDK 层钩子在拿到 usage 后落账。"""
+    """包一层只为采集调用方；token 由 SDK 层钩子在拿到 usage 后落账。
+
+    这里用「记住旧值再写回」而不是 set/reset：调用方可能在子任务或线程里跑
+    （如 livingmemory 的检索），reset 一个属于别的 Context 的 token 会抛
+    ``Token was created in a different Context``，把调用方的检索整条打断。
+    """
     def wrapper(self, *args, **kwargs):
         frames, plugin = _stack_info(sys._getframe(1))
-        ctx = {"frames": frames, "plugin": plugin, "model": _emb_provider_model(self)}
-        token = _EMB_CTX.set(ctx)
+        previous = _EMB_CTX.get()
+        _EMB_CTX.set({"frames": frames, "plugin": plugin, "model": _emb_provider_model(self)})
         try:
             result = fn(self, *args, **kwargs)
         except Exception:
-            _EMB_CTX.reset(token)
+            _EMB_CTX.set(previous)
             raise
         if inspect.iscoroutine(result):
             async def _await_it():
                 try:
                     return await result
                 finally:
-                    _EMB_CTX.reset(token)
+                    _EMB_CTX.set(previous)
             return _await_it()
-        _EMB_CTX.reset(token)
+        _EMB_CTX.set(previous)
         return result
 
     wrapper._siwu_billing = True
