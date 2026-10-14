@@ -430,6 +430,17 @@ def _emit(self, meth: str, resp, kw: dict, started: float, err: str | None,
         logger.debug("[llm_billing] 记录失败: %s", e)
 
 
+def _wrapped_by(fn, attr: str) -> bool:
+    """沿 __wrapped__ 链查标记：多个插件包同一方法时不重复套娃。"""
+    seen = 0
+    while fn is not None and seen < 10:
+        if getattr(fn, attr, False):
+            return True
+        fn = getattr(fn, "__wrapped__", None)
+        seen += 1
+    return False
+
+
 def _wrap(meth: str, fn):
     """包装 provider 调用，并在**协程创建时**采一次调用栈。
 
@@ -459,6 +470,7 @@ def _wrap(meth: str, fn):
 
         if hasattr(inspect, "markcoroutinefunction"):  # 3.12+：保持协程函数语义
             inspect.markcoroutinefunction(wrapper)
+        wrapper.__wrapped__ = fn
         return wrapper
 
     def wrapper_stream(self, *args, **kwargs):
@@ -477,6 +489,7 @@ def _wrap(meth: str, fn):
             finally:
                 _emit(self, meth, last, kwargs, started, err, created)
         return _iterate()
+    wrapper_stream.__wrapped__ = fn
     return wrapper_stream
 
 
@@ -594,6 +607,7 @@ def _wrap_embedding_provider(fn):
         return result
 
     wrapper._siwu_billing = True
+    wrapper.__wrapped__ = fn
     return wrapper
 
 
@@ -669,7 +683,7 @@ def patch_embedding_providers() -> tuple[int, list[str]]:
     for cls in classes:
         for meth in ("get_embedding", "get_embeddings"):
             fn = cls.__dict__.get(meth)
-            if fn is None or getattr(fn, "_siwu_billing", False):
+            if fn is None or _wrapped_by(fn, "_siwu_billing"):
                 continue
             if not inspect.iscoroutinefunction(fn):
                 continue
@@ -760,7 +774,7 @@ def patch_providers() -> tuple[int, list[str]]:
     for cls in classes:
         for meth in ("text_chat", "text_chat_stream"):
             fn = cls.__dict__.get(meth)
-            if fn is None or getattr(fn, "_siwu_billing", False):
+            if fn is None or _wrapped_by(fn, "_siwu_billing"):
                 continue
             if meth == "text_chat" and not inspect.iscoroutinefunction(fn):
                 continue
