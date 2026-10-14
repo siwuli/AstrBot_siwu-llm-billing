@@ -81,7 +81,8 @@ _ORIGIN_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("jargon", ("jargon_miner", "jargon_query", "jargon_")),
     ("decision", ("decision_ai", "probability_manager", "proactive_chat", "attention_manager")),
 )
-_PIPELINE_MARKS = ("process_stage", "agent_sub_stages", "third_party", "core.pipeline")
+_PIPELINE_MARKS = ("process_stage", "agent_sub_stages", "third_party", "core.pipeline",
+                   "astr_main_agent")
 
 
 # ----------------------------------------------------------------------
@@ -153,12 +154,17 @@ _BUFFER: list[dict] = []
 _SEEN_FRAMES = 40
 
 
-def _stack_info():
-    """收集调用栈（跳过 provider 自身与包装层），返回 (frames, 插件目录名)。"""
+def _stack_info(start=None):
+    """收集调用栈（跳过 provider 自身与包装层），返回 (frames, 插件目录名)。
+
+    ``start`` 为起始帧，默认取本函数的上上层。协程**创建时**的帧链同样用本函数
+    采集——AstrBot 会把 provider 调用丢进子任务执行（见 :func:`_wrap`），那时
+    执行栈里只剩 asyncio 内部帧。
+    """
     frames: list[str] = []
     plugin = ""
     try:
-        f = sys._getframe(2)
+        f = start if start is not None else sys._getframe(2)
     except Exception:  # noqa: BLE001
         return frames, plugin
     n = 0
@@ -213,7 +219,9 @@ def _prompt_size(kw: dict) -> tuple[int, int]:
     return total, len(str(kw.get("system_prompt") or ""))
 
 
-def _emit(self, meth: str, resp, kw: dict, started: float, err: str | None) -> None:
+def _emit(self, meth: str, resp, kw: dict, started: float, err: str | None,
+          created: tuple[list[str], str] | None = None) -> None:
+    """落一条记录。``created`` 是协程创建时采到的 (frames, plugin)，优先用它归因。"""
     try:
         pid = ""
         cfg = getattr(self, "provider_config", None)
@@ -226,6 +234,10 @@ def _emit(self, meth: str, resp, kw: dict, started: float, err: str | None) -> N
         in_other, in_cached, out = _usage_of(resp) if resp is not None else (0, 0, 0)
         pchars, schars = _prompt_size(kw)
         frames, plugin = _stack_info()
+        if created:
+            made_frames, made_plugin = created
+            frames = made_frames + [f for f in frames if f not in made_frames]
+            plugin = made_plugin or plugin
         _BUFFER.append({
             "ts": time.time(),
             "kind": meth,
@@ -251,30 +263,52 @@ def _emit(self, meth: str, resp, kw: dict, started: float, err: str | None) -> N
 
 
 def _wrap(meth: str, fn):
+    """包装 provider 调用，并在**协程创建时**采一次调用栈。
+
+    AstrBot 的 agent 会把 provider 调用塞进子任务再 await
+    （``tool_loop_agent_runner._await_or_stop`` 里的 ``asyncio.create_task``、
+    ``provider.test`` 的 ``asyncio.wait_for``、WebChat 的 ``create_task`` 等），
+    子任务执行时栈里只剩 asyncio 内部帧，调用方（管线或插件）全部丢失，
+    归因于是退化成「未知来源」。协程对象是在调用方帧里构造的，所以包装层先
+    同步采一次栈，执行时再把「创建栈 + 执行栈」一起交给归因。
+    """
     if meth == "text_chat":
-        async def wrapper(self, *args, **kwargs):
-            started, resp, err = time.time(), None, None
+        def wrapper(self, *args, **kwargs):
+            created = _stack_info(sys._getframe(1))
+            coro = fn(self, *args, **kwargs)
+
+            async def _invoke():
+                started, resp, err = time.time(), None, None
+                try:
+                    resp = await coro
+                    return resp
+                except Exception as e:
+                    err = f"{type(e).__name__}: {e}"
+                    raise
+                finally:
+                    _emit(self, meth, resp, kwargs, started, err, created)
+            return _invoke()
+
+        if hasattr(inspect, "markcoroutinefunction"):  # 3.12+：保持协程函数语义
+            inspect.markcoroutinefunction(wrapper)
+        return wrapper
+
+    def wrapper_stream(self, *args, **kwargs):
+        created = _stack_info(sys._getframe(1))
+        agen = fn(self, *args, **kwargs)
+
+        async def _iterate():
+            started, last, err = time.time(), None, None
             try:
-                resp = await fn(self, *args, **kwargs)
-                return resp
+                async for item in agen:
+                    last = item
+                    yield item
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
                 raise
             finally:
-                _emit(self, meth, resp, kwargs, started, err)
-        return wrapper
-
-    async def wrapper_stream(self, *args, **kwargs):
-        started, last, err = time.time(), None, None
-        try:
-            async for item in fn(self, *args, **kwargs):
-                last = item
-                yield item
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            raise
-        finally:
-            _emit(self, meth, last, kwargs, started, err)
+                _emit(self, meth, last, kwargs, started, err, created)
+        return _iterate()
     return wrapper_stream
 
 
